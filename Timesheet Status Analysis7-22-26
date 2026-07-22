@@ -1,0 +1,695 @@
+// ==UserScript==
+// @name         My CPE One — Timesheet Status Analysis
+// @namespace    mycpeone.timesheet.tracker
+// @version      6.8.0
+// @description  Full-screen analysis view of Team Timesheets on My CPE One: Published / Pending / Weekend status per date & associate, pulled live from the backend API. Filter by Associate, pick a date range (or quick-select Current Week (Mon–Sun) / Current Month). Weekend = Saturday & Sunday. The Associate column header has a one-click A-Z/Z-A sort so "All associates" view groups rows name-wise. Auto-pops the panel every time you actually log in (detected via the site's own "Login successfully" banner), defaulting to your own name + Current Week, the same way the site's "Important Updates" modal appears. Pending rows for today/yesterday show an inline EOD publish reminder (orange for today, light red for yesterday).
+// @author       you
+// @match        https://user.my-cpe.com/*
+// @match        https://*.my-cpe.com/*
+// @grant        GM_addStyle
+// @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/GTM20000/GTM/main/mycpeone-timesheet-status.user.js
+// @downloadURL  https://raw.githubusercontent.com/GTM20000/GTM/main/mycpeone-timesheet-status.user.js
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ------------------------------------------------------------------
+   * CONFIG
+   * ------------------------------------------------------------------ */
+
+  // Backend endpoint (captured from the real "Search" call on the
+  // Team Timesheets page via DevTools > Network).
+  const API_URL = 'https://user.my-cpe.com/index.php?controller=timesheets&task=getTeamTimesheetScreenDataAjax';
+
+  // This is tied to your logged-in session (from your cURL).
+  // If this script is ever run under a different My CPE One account,
+  // grab a fresh cURL for that account and update this value.
+  const LOGIN_ID = '35';
+
+  // Your own name, EXACTLY as it appears in the Associate dropdown /
+  // top-right corner of the page (e.g. "Gautam Prajapati"). Used so
+  // the auto-popup can default straight to your own Current Week
+  // status instead of "All associates". Update this if the script is
+  // ever run under a different account.
+  const MY_ASSOCIATE_NAME = 'Gautam Prajapati';
+
+  // Reminder shown inline in the Client(s) column for a "pending" row
+  // that falls on today or yesterday, so it's hard to miss before EOD.
+  const REMINDER_TEXT = '⏱ Please take a moment to publish your timesheet before EOD';
+
+  const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+  /* ------------------------------------------------------------------
+   * Date helpers
+   * ------------------------------------------------------------------ */
+
+  function parseDateLabel(label) {
+    const m = label.match(/([A-Za-z]{3})\s+(\d{1,2}),?\s*(\d{4})/);
+    if (!m) return null;
+    const mi = MONTHS.indexOf(m[1].slice(0, 3));
+    if (mi === -1) return null;
+    return new Date(parseInt(m[3], 10), mi, parseInt(m[2], 10));
+  }
+
+  function formatDateLabel(d) {
+    return `${MONTHS[d.getMonth()]} ${String(d.getDate()).padStart(2, '0')}, ${d.getFullYear()}`;
+  }
+
+  function weekdayShort(d) {
+    return ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
+  }
+
+  // Weekend is Saturday and Sunday.
+  function isWeekend(d) {
+    const dow = d.getDay();
+    return dow === 0 || dow === 6;
+  }
+
+  // Calendar-day equality (ignores time-of-day), used to match a row's
+  // date against "today" / "yesterday" for the EOD reminder.
+  function isSameLocalDate(a, b) {
+    return a.getFullYear() === b.getFullYear() &&
+      a.getMonth() === b.getMonth() &&
+      a.getDate() === b.getDate();
+  }
+
+  function parseHoursLabel(label) {
+    const m = (label || '').match(/(\d+):(\d+)/);
+    if (!m) return 0;
+    return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+  }
+
+  function formatMinutes(mins) {
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return `${h}:${String(m).padStart(2, '0')}`;
+  }
+
+  // API wants DD-MM-YYYY (see your cURL: start_date=01-07-2026)
+  function toApiDate(d) {
+    return `${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
+  }
+
+  /* ------------------------------------------------------------------
+   * Pull rows straight from the backend instead of scraping the
+   * on-screen table. team_associate stays 0 ("all") — we always fetch
+   * everyone and let buildResults() group by associate.
+   * ------------------------------------------------------------------ */
+
+  async function fetchRowsFromAPI(startDate, endDate) {
+    const body = new URLSearchParams({
+      start_date: toApiDate(startDate),
+      end_date: toApiDate(endDate),
+      login_id: LOGIN_ID,
+      team_associate: '0',
+      team_is_reviewed: ''
+    });
+
+    const res = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest'
+      },
+      credentials: 'include', // send your My CPE One session cookie
+      body: body.toString()
+    });
+
+    if (!res.ok) {
+      throw new Error(`Timesheet API request failed (${res.status}). Your session may have expired — try refreshing the page and logging in again.`);
+    }
+
+    const data = await res.json();
+    return parseRowsFromHtml(data && data.html ? data.html : '');
+  }
+
+  // The API returns { html: "<tr>...</tr><tr>...</tr>..." } — a bare
+  // fragment, not a full table — so we wrap it before parsing.
+  function parseRowsFromHtml(html) {
+    const wrapper = document.createElement('table');
+    wrapper.innerHTML = `<tbody>${html}</tbody>`;
+    return Array.from(wrapper.querySelectorAll('tr')).map(tr => {
+      const tds = tr.querySelectorAll('td');
+      if (tds.length < 5) return null;
+      const dateLabel = tds[0].textContent.trim();
+      const date = parseDateLabel(dateLabel);
+      const associate = tds[1].textContent.trim();
+      const code = tds[2] ? tds[2].textContent.trim() : '';
+      const client = tds[3] ? tds[3].textContent.trim() : '';
+      const hoursLabel = tds[4] ? tds[4].textContent.trim() : '';
+      if (!date || !associate) return null;
+      return { dateLabel, date, associate, code, client, hoursLabel };
+    }).filter(Boolean);
+  }
+
+  /* ------------------------------------------------------------------
+   * Build Published / Pending / Weekend results for a date range
+   * (unchanged — still works off the same row shape). employeeFilter
+   * of 'ALL' (or falsy) shows everyone; otherwise only that associate.
+   * Default order here is chronological (date, then associate); the
+   * table's Associate-column sort arrows can re-order the rendered
+   * rows by associate name without touching this.
+   * ------------------------------------------------------------------ */
+
+  function buildResults(rows, employeeFilter, rangeStart, rangeEnd) {
+    const byKey = {};
+    const allAssociates = new Set();
+
+    rows.forEach(r => {
+      allAssociates.add(r.associate);
+      const key = r.associate + '|||' + r.dateLabel;
+      if (!byKey[key]) byKey[key] = { associate: r.associate, dateLabel: r.dateLabel, minutes: 0, clients: new Set() };
+      byKey[key].minutes += parseHoursLabel(r.hoursLabel);
+      if (r.client) byKey[key].clients.add(r.client);
+    });
+
+    let minDate = rangeStart, maxDate = rangeEnd;
+    if (!minDate || !maxDate) {
+      const dates = rows.map(r => r.date.getTime());
+      if (!dates.length) return { results: [], associates: [], summary: {} };
+      minDate = new Date(Math.min(...dates));
+      maxDate = new Date(Math.max(...dates));
+    }
+
+    let employees;
+    if (!employeeFilter || employeeFilter === 'ALL') {
+      employees = Array.from(allAssociates);
+    } else {
+      employees = [employeeFilter];
+    }
+    employees.sort((a, b) => a.localeCompare(b));
+
+    const results = [];
+    const summary = {};
+    employees.forEach(e => { summary[e] = { published: 0, pending: 0, weekend: 0, minutes: 0 }; });
+
+    for (let d = new Date(minDate); d <= maxDate; d.setDate(d.getDate() + 1)) {
+      const dateLabel = formatDateLabel(d);
+      const weekend = isWeekend(d);
+      employees.forEach(emp => {
+        const key = emp + '|||' + dateLabel;
+        const entry = byKey[key];
+        let status;
+        if (weekend) status = 'weekend';
+        else if (entry) status = 'published';
+        else status = 'pending';
+        summary[emp][status]++;
+        if (entry) summary[emp].minutes += entry.minutes;
+        results.push({
+          date: new Date(d),
+          dateLabel,
+          weekday: weekdayShort(d),
+          associate: emp,
+          status,
+          minutes: entry ? entry.minutes : 0,
+          clients: entry ? Array.from(entry.clients) : []
+        });
+      });
+    }
+    results.sort((a, b) => a.date - b.date || a.associate.localeCompare(b.associate));
+    return { results, associates: Array.from(allAssociates).sort((a, b) => a.localeCompare(b)), summary };
+  }
+
+  /* ------------------------------------------------------------------
+   * UI — large full-screen analysis panel
+   * ------------------------------------------------------------------ */
+
+  GM_addStyle(`
+    #cpeone-launcher {
+      position: fixed; right: 18px; bottom: 18px; z-index: 999998;
+      background: #14213d; color: #fff; border: none; border-radius: 999px;
+      padding: 11px 18px; font-weight: 700; font-size: 13px; cursor: pointer;
+      box-shadow: 0 6px 18px rgba(0,0,0,.25); font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      display: flex; align-items: center; gap: 8px;
+    }
+    #cpeone-launcher .dot { width: 8px; height: 8px; border-radius: 50%; background: #f0a83c; }
+    #cpeone-overlay {
+      position: fixed; inset: 0; z-index: 999999; background: rgba(15,20,32,.55);
+      display: none; align-items: center; justify-content: center;
+      font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    }
+    #cpeone-overlay.open { display: flex; }
+    #cpeone-modal {
+      width: 96vw; height: 93vh; background: #f5f6f8; border-radius: 12px; overflow: hidden;
+      display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,.35);
+    }
+    #cpeone-modal .cm-head {
+      background: #14213d; color: #fff; padding: 16px 22px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    #cpeone-modal .cm-head h2 { margin: 0; font-size: 19px; font-weight: 700; }
+    #cpeone-modal .cm-head .cm-sub { font-size: 12px; color: #b7bece; margin-top: 2px; font-weight: 400; }
+    #cpeone-modal .cm-close {
+      background: rgba(255,255,255,.12); border: none; color: #fff; width: 32px; height: 32px; border-radius: 8px;
+      font-size: 16px; cursor: pointer;
+    }
+    #cpeone-modal .cm-filters {
+      background: #fff; padding: 14px 22px; display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap;
+      border-bottom: 1px solid #e7e9ee;
+    }
+    #cpeone-modal .cm-field { display: flex; flex-direction: column; gap: 4px; min-width: 160px; }
+    #cpeone-modal .cm-field label { font-size: 10.5px; font-weight: 700; text-transform: uppercase; color: #6b7280; letter-spacing: .04em; }
+    #cpeone-modal select, #cpeone-modal input[type=date] {
+      font-size: 13px; padding: 7px 9px; border: 1px solid #d7dbe0; border-radius: 6px; background: #fff; color: #222;
+    }
+    #cpeone-modal .cm-btns { display: flex; gap: 8px; }
+    #cpeone-modal .cm-btns button { font-size: 13px; font-weight: 700; padding: 8px 16px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; }
+    #cpeone-modal .cm-search { background: #2f5fdb; color: #fff; }
+    #cpeone-modal .cm-clear { background: #fff; color: #333; border-color: #d7dbe0; }
+
+    #cpeone-modal .cm-summary {
+      display: flex; gap: 12px; padding: 14px 22px; overflow-x: auto; background: #f5f6f8;
+      border-bottom: 1px solid #e7e9ee;
+    }
+    #cpeone-modal .cm-card {
+      flex: none; min-width: 190px; background: #fff; border: 1px solid #e7e9ee; border-radius: 10px; padding: 12px 14px;
+    }
+    #cpeone-modal .cm-card .cm-name { font-weight: 700; font-size: 13.5px; margin-bottom: 8px; }
+    #cpeone-modal .cm-card .cm-stats { display: flex; gap: 10px; }
+    #cpeone-modal .cm-card .cm-stat { text-align: center; }
+    #cpeone-modal .cm-card .cm-stat .n { font-size: 16px; font-weight: 700; font-family: 'Courier New', monospace; }
+    #cpeone-modal .cm-card .cm-stat .l { font-size: 9.5px; text-transform: uppercase; color: #9aa0aa; letter-spacing: .03em; }
+    #cpeone-modal .cm-card .cm-stat.published .n { color: #1f8a5f; }
+    #cpeone-modal .cm-card .cm-stat.pending .n { color: #c07a1f; }
+    #cpeone-modal .cm-card .cm-stat.weekend .n { color: #8b93a6; }
+    #cpeone-modal .cm-card .cm-hours { margin-top: 8px; font-size: 11px; color: #6b7280; }
+
+    #cpeone-modal .cm-table-wrap { flex: 1; overflow: auto; padding: 0 22px 20px; }
+    #cpeone-modal table { width: 100%; border-collapse: collapse; background: #fff; }
+    #cpeone-modal thead th {
+      position: sticky; top: 0; background: #eef0f4; text-align: left; font-size: 11px; text-transform: uppercase;
+      letter-spacing: .03em; color: #57606f; padding: 10px 12px; border-bottom: 1px solid #dfe2e8; z-index: 1;
+    }
+    #cpeone-modal .cm-th-flex { display: inline-flex; align-items: center; gap: 4px; }
+    #cpeone-modal .cm-th-sort-group { display: inline-flex; flex-direction: column; gap: 1px; margin-left: 1px; }
+    #cpeone-modal .cm-th-arrow {
+      border: none; background: transparent; cursor: pointer; padding: 0; margin: 0;
+      font-size: 8px; line-height: 8px; color: #9aa0aa; letter-spacing: 0;
+    }
+    #cpeone-modal .cm-th-arrow:hover { color: #2f5fdb; }
+    #cpeone-modal .cm-th-arrow.active { color: #2f5fdb; }
+    #cpeone-modal tbody td { padding: 9px 12px; border-bottom: 1px solid #f0f1f4; font-size: 13px; }
+    #cpeone-modal tbody tr:hover { background: #fafbfc; }
+    #cpeone-modal .cm-status { font-weight: 700; font-size: 12px; padding: 3px 10px; border-radius: 999px; display: inline-block; }
+    #cpeone-modal .cm-status.published { background: #e3f3ea; color: #1f8a5f; }
+    #cpeone-modal .cm-status.pending { background: #faedd9; color: #c07a1f; }
+    #cpeone-modal .cm-status.weekend { background: #eef0f3; color: #8b93a6; }
+    #cpeone-modal .cm-empty { text-align: center; color: #9aa0aa; padding: 40px 6px; font-size: 13px; }
+    #cpeone-modal .cm-weekday { color: #9aa0aa; font-size: 11px; margin-left: 6px; }
+
+    /* EOD publish reminder shown in the Client(s) column for a
+       "pending" row that falls on today (orange, matches the Pending
+       status color) or yesterday (light red, more urgent). */
+    #cpeone-modal .cm-reminder {
+      display: inline-block; padding: 5px 10px; border-radius: 6px;
+      font-weight: 700; font-size: 12px;
+    }
+    #cpeone-modal .cm-reminder-today { background: #faedd9; color: #c07a1f; }
+    #cpeone-modal .cm-reminder-yesterday { background: #fbdada; color: #c0392b; }
+  `);
+
+  let manualStart = null;
+  let manualEnd = null;
+  let manualEmployee = 'ALL'; // default: show everyone, so nobody gets silently hidden
+
+  // Sort mode for the rendered results table: 'date' is the normal
+  // chronological order; 'associateAsc'/'associateDesc' group rows by
+  // associate name (toggled by the ▲/▼ arrows in the Associate table
+  // header). Purely a display re-order — doesn't touch the fetch.
+  let tableSortMode = 'date';
+
+  // Associates & results from the most recent fetch, cached so the
+  // Associate-column sort arrows can re-order instantly without
+  // re-fetching from the API.
+  let lastAssociates = [];
+  let lastResults = [];
+
+  // Reference to the overlay element, set once ensureUI() builds it,
+  // so openModalAndLoad() (used by both the launcher button and the
+  // automatic login trigger) can reach it.
+  let overlayEl = null;
+
+  // Since the API needs explicit dates, default to month-to-date
+  // whenever no manual range is picked.
+  function defaultRange() {
+    const today = new Date();
+    const start = new Date(today.getFullYear(), today.getMonth(), 1);
+    return { start, end: today };
+  }
+
+  // Monday-through-Sunday range containing today (weekend is
+  // Saturday and Sunday).
+  function currentWeekRange() {
+    const today = new Date();
+    const dow = today.getDay(); // 0 = Sunday .. 6 = Saturday
+    const diffToMonday = (dow + 6) % 7; // days since the most recent Monday
+    const start = new Date(today.getFullYear(), today.getMonth(), today.getDate() - diffToMonday);
+    const end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6); // Sunday
+    return { start, end };
+  }
+
+  // 1st through the last day of the current month.
+  function currentMonthRange() {
+    const today = new Date();
+    const start = new Date(today.getFullYear(), today.getMonth(), 1);
+    const end = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+    return { start, end };
+  }
+
+  function toInputValue(d) {
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  // Rebuilds the Associate <select>'s options from lastAssociates
+  // (always plain A→Z — the sort toggle now lives on the table, not
+  // here), keeping manualEmployee selected if still a valid option.
+  function populateAssociateSelect(overlay) {
+    const sel = overlay.querySelector('#cm-associate');
+    sel.innerHTML = `
+      <option value="ALL">All associates</option>
+      ${lastAssociates.map(a => `<option value="${a}">${a}</option>`).join('')}
+    `;
+    sel.value = [...sel.options].some(o => o.value === manualEmployee) ? manualEmployee : 'ALL';
+  }
+
+  // Returns lastResults ordered according to tableSortMode, without
+  // needing a re-fetch.
+  function getSortedResults() {
+    const arr = lastResults.slice();
+    if (tableSortMode === 'associateAsc') {
+      arr.sort((a, b) => a.associate.localeCompare(b.associate) || a.date - b.date);
+    } else if (tableSortMode === 'associateDesc') {
+      arr.sort((a, b) => b.associate.localeCompare(a.associate) || a.date - b.date);
+    } else {
+      arr.sort((a, b) => a.date - b.date || a.associate.localeCompare(b.associate));
+    }
+    return arr;
+  }
+
+  // Reflects which sort arrow (if any) is currently active.
+  function updateSortHeaderUI(overlay) {
+    const upBtn = overlay.querySelector('#cm-th-sort-up');
+    const downBtn = overlay.querySelector('#cm-th-sort-down');
+    if (!upBtn || !downBtn) return;
+    upBtn.classList.toggle('active', tableSortMode === 'associateAsc');
+    downBtn.classList.toggle('active', tableSortMode === 'associateDesc');
+  }
+
+  // Renders the results table body (+ total row) from lastResults,
+  // applying the current sort. Shared by renderAll() (after a fetch)
+  // and the Associate-column sort arrows (no fetch needed).
+  function renderResultsTable(overlay) {
+    const tbody = overlay.querySelector('#cm-tbody');
+    const results = getSortedResults();
+
+    if (!results.length) {
+      tbody.innerHTML = `<tr><td colspan="5"><div class="cm-empty">No rows found for this date range.</div></td></tr>`;
+      return;
+    }
+
+    // "Today" and "yesterday" at midnight, so date-only comparisons
+    // against each row's (also midnight) date work correctly and
+    // don't depend on time-of-day.
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+
+    tbody.innerHTML = results.map(r => {
+      const label = r.status === 'published' ? 'Published' : r.status === 'weekend' ? 'Weekend' : 'Pending';
+
+      let clientText;
+      if (r.status === 'weekend') {
+        clientText = '—';
+      } else if (r.status === 'pending' && isSameLocalDate(r.date, today)) {
+        // Still pending today — orange, same as the Pending status color.
+        clientText = `<div class="cm-reminder cm-reminder-today">${REMINDER_TEXT}</div>`;
+      } else if (r.status === 'pending' && isSameLocalDate(r.date, yesterday)) {
+        // Still pending from yesterday — light red, more urgent.
+        clientText = `<div class="cm-reminder cm-reminder-yesterday">${REMINDER_TEXT}</div>`;
+      } else {
+        clientText = r.clients.length ? r.clients.join(', ') : '—';
+      }
+
+      const timeText = r.status === 'weekend' ? '—' : (r.minutes ? formatMinutes(r.minutes) + ' hrs' : '—');
+      return `
+        <tr>
+          <td>${r.dateLabel}<span class="cm-weekday">${r.weekday}</span></td>
+          <td>${r.associate}</td>
+          <td>${clientText}</td>
+          <td>${timeText}</td>
+          <td><span class="cm-status ${r.status}">${label}</span></td>
+        </tr>`;
+    }).join('');
+
+    // total of the Total Time column across everything shown.
+    const totalMinutes = results.reduce((sum, r) => sum + r.minutes, 0);
+    tbody.innerHTML += `
+      <tr style="font-weight:700; background:#f5f6f8;">
+        <td colspan="3" style="text-align:right;">Total</td>
+        <td>${formatMinutes(totalMinutes)} hrs</td>
+        <td></td>
+      </tr>`;
+  }
+
+  // Opens the panel (creating/refreshing it) using whatever filters
+  // are currently set in manualStart/manualEnd/manualEmployee —
+  // shared by the launcher button and the automatic login trigger.
+  function openModalAndLoad() {
+    if (!overlayEl) return;
+    overlayEl.classList.add('open');
+    renderAll();
+  }
+
+  function ensureUI() {
+    if (document.getElementById('cpeone-overlay')) {
+      overlayEl = document.getElementById('cpeone-overlay');
+      return;
+    }
+
+    const launcher = document.createElement('button');
+    launcher.id = 'cpeone-launcher';
+    launcher.innerHTML = `<span class="dot"></span> Timesheet Status`;
+    document.body.appendChild(launcher);
+
+    const overlay = document.createElement('div');
+    overlay.id = 'cpeone-overlay';
+    overlay.innerHTML = `
+      <div id="cpeone-modal">
+        <div class="cm-head">
+          <div>
+            <h2>Timesheet Status — Full Analysis</h2>
+            <div class="cm-sub">Pulled live from the My CPE One backend for the date range below.</div>
+          </div>
+          <button class="cm-close" id="cm-close">✕</button>
+        </div>
+        <div class="cm-filters">
+          <div class="cm-field">
+            <label>Associate</label>
+            <select id="cm-associate">
+              <option value="ALL">All associates</option>
+            </select>
+          </div>
+          <div class="cm-field">
+            <label>From Date</label>
+            <input type="date" id="cm-from">
+          </div>
+          <div class="cm-field">
+            <label>To Date</label>
+            <input type="date" id="cm-to">
+          </div>
+          <div class="cm-field">
+            <label>Quick Range</label>
+            <select id="cm-quickrange">
+              <option value="">Custom</option>
+              <option value="week">Current Week</option>
+              <option value="month">Current Month</option>
+            </select>
+          </div>
+          <div class="cm-btns">
+            <button class="cm-search" id="cm-search">Search</button>
+            <button class="cm-clear" id="cm-clear">Clear</button>
+          </div>
+        </div>
+        <div class="cm-summary" id="cm-summary"></div>
+        <div class="cm-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:150px;">Date</th>
+                <th style="width:220px;">
+                  <span class="cm-th-flex">
+                    <span>Associate</span>
+                    <span class="cm-th-sort-group">
+                      <button type="button" id="cm-th-sort-up" class="cm-th-arrow" title="Sort Associate A→Z">▲</button>
+                      <button type="button" id="cm-th-sort-down" class="cm-th-arrow" title="Sort Associate Z→A">▼</button>
+                    </span>
+                  </span>
+                </th>
+                <th>Client(s)</th>
+                <th style="width:110px;">Total Time</th>
+                <th style="width:150px;">Status</th>
+              </tr>
+            </thead>
+            <tbody id="cm-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlayEl = overlay;
+
+    // Prefill the date pickers with the default range so the user can
+    // see (and tweak) exactly what's being queried.
+    const { start, end } = defaultRange();
+    overlay.querySelector('#cm-from').value = toInputValue(start);
+    overlay.querySelector('#cm-to').value = toInputValue(end);
+
+    launcher.addEventListener('click', () => { openModalAndLoad(); });
+    overlay.querySelector('#cm-close').addEventListener('click', () => overlay.classList.remove('open'));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.classList.remove('open'); });
+
+    // Associate-column sort arrows — one click each, no re-fetch.
+    // Clicking the already-active arrow reverts to normal date order.
+    overlay.querySelector('#cm-th-sort-up').addEventListener('click', () => {
+      tableSortMode = tableSortMode === 'associateAsc' ? 'date' : 'associateAsc';
+      updateSortHeaderUI(overlay);
+      renderResultsTable(overlay);
+    });
+    overlay.querySelector('#cm-th-sort-down').addEventListener('click', () => {
+      tableSortMode = tableSortMode === 'associateDesc' ? 'date' : 'associateDesc';
+      updateSortHeaderUI(overlay);
+      renderResultsTable(overlay);
+    });
+
+    // Quick Range only updates the From/To fields — Search still
+    // triggers the actual fetch, so you can tweak dates after picking.
+    overlay.querySelector('#cm-quickrange').addEventListener('change', (e) => {
+      const val = e.target.value;
+      let range;
+      if (val === 'week') range = currentWeekRange();
+      else if (val === 'month') range = currentMonthRange();
+      else return;
+      overlay.querySelector('#cm-from').value = toInputValue(range.start);
+      overlay.querySelector('#cm-to').value = toInputValue(range.end);
+    });
+
+    overlay.querySelector('#cm-search').addEventListener('click', () => {
+      const fromVal = overlay.querySelector('#cm-from').value;
+      const toVal = overlay.querySelector('#cm-to').value;
+      manualStart = fromVal ? new Date(fromVal + 'T00:00:00') : null;
+      manualEnd = toVal ? new Date(toVal + 'T00:00:00') : null;
+      manualEmployee = overlay.querySelector('#cm-associate').value;
+      renderAll();
+    });
+    overlay.querySelector('#cm-clear').addEventListener('click', () => {
+      manualStart = null; manualEnd = null; manualEmployee = 'ALL';
+      const { start, end } = defaultRange();
+      overlay.querySelector('#cm-from').value = toInputValue(start);
+      overlay.querySelector('#cm-to').value = toInputValue(end);
+      overlay.querySelector('#cm-quickrange').value = '';
+      overlay.querySelector('#cm-associate').value = 'ALL';
+      renderAll();
+    });
+  }
+
+  async function renderAll() {
+    const overlay = document.getElementById('cpeone-overlay');
+    if (!overlay) return;
+
+    const tbody = overlay.querySelector('#cm-tbody');
+    const summaryEl = overlay.querySelector('#cm-summary');
+    tbody.innerHTML = `<tr><td colspan="5"><div class="cm-empty">Loading…</div></td></tr>`;
+    summaryEl.innerHTML = '';
+
+    const { start: defStart, end: defEnd } = defaultRange();
+    const rangeStart = manualStart || defStart;
+    const rangeEnd = manualEnd || defEnd;
+
+    let rows;
+    try {
+      rows = await fetchRowsFromAPI(rangeStart, rangeEnd);
+    } catch (err) {
+      tbody.innerHTML = `<tr><td colspan="5"><div class="cm-empty">${err.message}</div></td></tr>`;
+      return;
+    }
+
+    const { results, associates, summary } = buildResults(rows, manualEmployee, rangeStart, rangeEnd);
+
+    // keep associate dropdown in sync with whoever the API returned.
+    lastAssociates = associates;
+    populateAssociateSelect(overlay);
+
+    // cache results for the table's own sort arrows, then render.
+    lastResults = results;
+    renderResultsTable(overlay);
+    updateSortHeaderUI(overlay);
+
+    // summary cards
+    const summaryNames = Object.keys(summary).sort((a, b) => a.localeCompare(b));
+    if (!summaryNames.length) {
+      summaryEl.innerHTML = `<div class="cm-empty">No data for this range.</div>`;
+    } else {
+      summaryEl.innerHTML = summaryNames.map(name => {
+        const s = summary[name];
+        return `
+        <div class="cm-card">
+          <div class="cm-name">${name}</div>
+          <div class="cm-stats">
+            <div class="cm-stat published"><div class="n">${s.published}</div><div class="l">Published</div></div>
+            <div class="cm-stat pending"><div class="n">${s.pending}</div><div class="l">Pending</div></div>
+            <div class="cm-stat weekend"><div class="n">${s.weekend}</div><div class="l">Weekend</div></div>
+          </div>
+          <div class="cm-hours">Total logged: ${formatMinutes(s.minutes)} hrs</div>
+        </div>`;
+      }).join('');
+    }
+  }
+
+  /* ------------------------------------------------------------------
+   * Auto-popup on login — mirrors the site's own "Important Updates"
+   * modal behavior: pops open on its own, no click needed, every time
+   * you actually log in — including logging out and back in during
+   * the same browser session. Detected by looking for the site's own
+   * "Login successfully" banner text, which only appears right after
+   * a fresh login rather than on ordinary page navigation, so this
+   * doesn't fire on every click around the site.
+   * Defaults the view to YOUR Current Week status first (Associate =
+   * MY_ASSOCIATE_NAME, Quick Range = Current Week), then you're free
+   * to change Associate / All associates / any range — exactly as
+   * before. Skipped on the login page itself, since you're not
+   * authenticated there yet.
+   * ------------------------------------------------------------------ */
+
+  function justLoggedIn() {
+    const bodyText = document.body ? document.body.innerText : '';
+    return /login\s+successfully/i.test(bodyText);
+  }
+
+  function maybeAutoShowOnLogin() {
+    if (/controller=login/i.test(window.location.href)) return;
+    if (!justLoggedIn()) return;
+
+    // Small delay so it appears after the page (and the site's own
+    // "Important Updates" popup, if present) has settled.
+    setTimeout(() => {
+      const wk = currentWeekRange();
+      manualStart = wk.start;
+      manualEnd = wk.end;
+      manualEmployee = MY_ASSOCIATE_NAME || 'ALL';
+
+      if (overlayEl) {
+        overlayEl.querySelector('#cm-from').value = toInputValue(wk.start);
+        overlayEl.querySelector('#cm-to').value = toInputValue(wk.end);
+        overlayEl.querySelector('#cm-quickrange').value = 'week';
+      }
+
+      openModalAndLoad();
+    }, 900);
+  }
+
+  ensureUI();
+  maybeAutoShowOnLogin();
+})();
